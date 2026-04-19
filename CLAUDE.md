@@ -8,38 +8,6 @@
 
 ---
 
-## 环境
-
-| 项 | 值 |
-|---|---|
-| Python | 3.10.20 |
-| PyTorch | 2.6.0+cu124 |
-| transformers | 5.5.4 |
-| accelerate | 1.13.0 |
-| 运行时 venv | `/venv/diffuspec` |
-| Python 解释器 | `/venv/diffuspec/bin/python` |
-| HuggingFace 缓存 | `HF_HOME=/workspace/.hf_home` |
-| GPU | NVIDIA GeForce RTX 3090 (24 GB VRAM) |
-
-运行任何脚本须用 `/venv/diffuspec/bin/python`，或先执行：
-```bash
-export PATH="/venv/diffuspec/bin:$PATH"
-export HF_HOME="/workspace/.hf_home"
-```
-
----
-
-## 本地已缓存模型
-
-| 角色 | Model ID | vocab_size | hidden_size | 备注 |
-|---|---|---|---|---|
-| DLM Drafter | `dream-org/dream-v0-instruct-7b` | 152064 | 3584 | `mask_token_id=151666` |
-| Target LM | `Qwen/Qwen3-8B` | 151936 | 4096 | 论文用 Qwen2.5-32B，本地只有 8B |
-
-> **注意**：论文目标模型是 Qwen2.5-32B，本地只缓存了 Qwen3-8B。二者 vocab_size 不同（151936 vs 152064），投机解码时需要对齐 tokenizer 或处理词表差异。
-
----
-
 ## 代码结构
 
 ```
@@ -73,22 +41,6 @@ diffuspec/
 | `beam_size` (B) | 3 | CPSConfig |
 | `lam` (λ) | 0.5 | CPSConfig |
 | `num_refinement_steps` (S) | 1 | DraftingConfig |
-
----
-
-## 已知问题与修复
-
-### transformers 5.x RoPE 兼容问题
-- **现象**：`KeyError: 'default'` 出现在 `DreamRotaryEmbedding.__init__`
-- **原因**：transformers 5.x 从 `ROPE_INIT_FUNCTIONS` 移除了 `'default'` key，Dream 模型代码基于旧版本编写
-- **修复**：`diffuspec/drafting/dlm_drafter.py` 模块顶层调用 `_patch_rope_init_functions()`，在 key 缺失时注入标准 RoPE 实现（`inv_freq = 1/base^(2i/dim)`, `scale=1.0`）
-
-### 磁盘空间
-- conda create 会填满磁盘，清理命令：
-  ```bash
-  /opt/miniforge3/bin/conda clean --all -y
-  /venv/diffuspec/bin/pip cache purge
-  ```
 
 ---
 
