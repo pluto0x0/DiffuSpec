@@ -93,12 +93,13 @@ class DiffuSpec:
             )
             target_model.eval()
 
-        # Drafter
+        # Drafter — restrict to target vocab so OOB token IDs never reach the AR model
         drafter = DLMDrafter(
             model_name=config.drafting.model_name,
             device=device,
             dtype=dtype,
             num_refinement_steps=config.drafting.num_refinement_steps,
+            target_vocab_size=target_tokenizer.vocab_size,
         )
 
         eos_token_id = (
@@ -175,6 +176,8 @@ class DiffuSpec:
             if self.config.eos_token_id is not None
             else self.verifier.eos_token_id
         )
+        # Use the verifier's full stop-token set (includes <|im_end|> etc.)
+        stop_ids = self.verifier._stop_ids or ({eos_id} if eos_id is not None else set())
 
         self.adl.reset()
         context = prefix_ids.clone()
@@ -214,7 +217,7 @@ class DiffuSpec:
                 next_id = self._greedy_step(context)
                 generated.append(next_id)
                 context = torch.cat([context, torch.tensor([next_id], device=context.device)])
-                if next_id == eos_id:
+                if next_id in stop_ids:
                     break
                 self.adl.update(l_gen=1, l_acc=1)
                 continue
@@ -222,7 +225,12 @@ class DiffuSpec:
             path_tensor = torch.tensor(path_tokens, dtype=torch.long, device=context.device)
 
             # ── Stage 3: L2R log-probs + Parallel verification ──────────
-            l2r_logprobs = self.drafter.compute_l2r_logprobs(context, path_tensor)
+            # L2R log-probs are only used for stochastic acceptance (temperature > 0).
+            # Skipping the O(k²) Dream batch call in greedy mode saves significant time.
+            if self.config.temperature > 0.0:
+                l2r_logprobs = self.drafter.compute_l2r_logprobs(context, path_tensor)
+            else:
+                l2r_logprobs = torch.zeros(path_len, device=context.device)
 
             accepted_ids, n_acc, hit_eos = self.verifier.verify(
                 prefix_ids=context,
@@ -238,7 +246,7 @@ class DiffuSpec:
 
             # ── Stage 4: ADL ─────────────────────────────────────────────
             # L^gen: EOS-aware generation length from raw DLM draft (Eq. 9)
-            l_gen = self._compute_l_gen(draft_ids, eos_id, k_t)
+            l_gen = self._compute_l_gen(draft_ids, stop_ids, k_t)
             self.adl.update(l_gen=l_gen, l_acc=n_acc)
 
             stats["n_steps"] += 1
@@ -253,7 +261,7 @@ class DiffuSpec:
                     f"ema_gen={self.adl.ema_gen:.1f} | ema_acc={self.adl.ema_acc:.1f}"
                 )
 
-            if hit_eos or (eos_id in accepted_list):
+            if hit_eos or bool(stop_ids & set(accepted_list)):
                 break
 
             if len(generated) >= max_new_tokens:
@@ -270,18 +278,16 @@ class DiffuSpec:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _compute_l_gen(draft_ids: torch.Tensor, eos_id: int, k_t: int) -> int:
+    def _compute_l_gen(draft_ids: torch.Tensor, stop_ids: set, k_t: int) -> int:
         """
         EOS-aware generation length L^gen_t = min(s_t − 1, k_t) (Eq. 9).
-        s_t is the index (1-based) of the first EOS in the raw draft.
-        If no EOS: L^gen = k_t.
+        s_t is the index (1-based) of the first stop token in the raw draft.
+        If no stop token: L^gen = k_t.
         """
-        eos_positions = (draft_ids == eos_id).nonzero(as_tuple=False)
-        if len(eos_positions) == 0:
-            return k_t
-        # s_t is 1-based; eos_positions[0][0] is 0-based index
-        s_t = eos_positions[0][0].item() + 1
-        return min(s_t - 1, k_t)
+        for i, tok in enumerate(draft_ids.tolist()):
+            if tok in stop_ids:
+                return min(i, k_t)  # s_t-1 where s_t = i+1
+        return k_t
 
     @torch.no_grad()
     def _greedy_step(self, context: torch.Tensor) -> int:

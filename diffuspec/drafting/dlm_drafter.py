@@ -68,10 +68,14 @@ class DLMDrafter:
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         num_refinement_steps: int = 1,
+        target_vocab_size: Optional[int] = None,
     ) -> None:
         self.device = device
         self.dtype = dtype
         self.num_refinement_steps = num_refinement_steps
+        # Tokens with IDs >= target_vocab_size are Dream-specific and unknown to the
+        # target AR model; mask them out so they are never drafted.
+        self.target_vocab_size = target_vocab_size
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_name, trust_remote_code=True
@@ -138,6 +142,9 @@ class DLMDrafter:
         for step in range(self.num_refinement_steps):
             logits = self._forward(current_ids)               # [1, L, V]
             draft_logits = logits[0, prefix_len:, :]          # [draft_len, V]
+            if self.target_vocab_size is not None and draft_logits.shape[-1] > self.target_vocab_size:
+                draft_logits = draft_logits.clone()
+                draft_logits[:, self.target_vocab_size:] = float("-inf")
             log_probs = F.log_softmax(draft_logits, dim=-1)   # [draft_len, V]
             draft_ids = log_probs.argmax(dim=-1)              # [draft_len]
 

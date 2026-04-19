@@ -36,6 +36,20 @@ class ARVerifier:
         self.tokenizer = tokenizer
         self.device = device
         self.eos_token_id: int = tokenizer.eos_token_id
+        # Build the full stop-token set from the model's generation_config so that
+        # chat-turn enders like <|im_end|> (Qwen2.5 token 151645) stop generation
+        # correctly, not just <|endoftext|>.
+        self._stop_ids: set = set()
+        if self.eos_token_id is not None:
+            self._stop_ids.add(self.eos_token_id)
+        try:
+            gen_eos = model.generation_config.eos_token_id
+            if isinstance(gen_eos, list):
+                self._stop_ids.update(gen_eos)
+            elif gen_eos is not None:
+                self._stop_ids.add(gen_eos)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Public API
@@ -66,6 +80,12 @@ class ARVerifier:
         prefix_ids = prefix_ids.to(self.device)
         draft_ids = draft_ids.to(self.device)
         draft_len = draft_ids.shape[0]
+
+        # Clamp any drafter-specific token IDs that exceed the target model's vocab.
+        # This should not happen when DLMDrafter.target_vocab_size is set correctly,
+        # but acts as a safety net against silent OOB embedding lookups.
+        target_vocab_size = self.model.config.vocab_size
+        draft_ids = draft_ids.clamp(max=target_vocab_size - 1)
 
         # Single parallel forward pass over prefix + draft block
         full_ids = torch.cat([prefix_ids, draft_ids], dim=0).unsqueeze(0)  # [1, L]
@@ -131,13 +151,13 @@ class ARVerifier:
         for i in range(draft_len):
             if greedy_tokens[i].item() == draft_ids[i].item():
                 accepted.append(draft_ids[i])
-                if draft_ids[i].item() == self.eos_token_id:
+                if draft_ids[i].item() in self._stop_ids:
                     hit_eos = True
                     break
             else:
                 # Rejection: take the target's greedy token as replacement
                 accepted.append(greedy_tokens[i])
-                if greedy_tokens[i].item() == self.eos_token_id:
+                if greedy_tokens[i].item() in self._stop_ids:
                     hit_eos = True
                 break
 
@@ -147,7 +167,7 @@ class ARVerifier:
             bonus_logits = full_logits[prefix_len - 1 + draft_len]  # next position
             bonus_tok = bonus_logits.argmax()
             accepted.append(bonus_tok)
-            if bonus_tok.item() == self.eos_token_id:
+            if bonus_tok.item() in self._stop_ids:
                 hit_eos = True
 
         return torch.stack(accepted), n_accepted, hit_eos
@@ -179,7 +199,7 @@ class ARVerifier:
 
             if u <= alpha:
                 accepted.append(draft_ids[i])
-                if draft_ids[i].item() == self.eos_token_id:
+                if draft_ids[i].item() in self._stop_ids:
                     hit_eos = True
                     break
             else:
@@ -196,7 +216,7 @@ class ARVerifier:
                 else:
                     replacement = p_dist.argmax()
                 accepted.append(replacement)
-                if replacement.item() == self.eos_token_id:
+                if replacement.item() in self._stop_ids:
                     hit_eos = True
                 break
 

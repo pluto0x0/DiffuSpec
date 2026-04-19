@@ -76,9 +76,16 @@ def main():
     print(f"Loading DiffuSpec (target={args.target_model}, drafter={args.drafter_model})...")
     engine = DiffuSpec.from_config(config, device=args.device)
 
-    # Tokenise prompt using the target tokenizer
+    # Tokenise prompt using the target tokenizer, applying the instruct chat template
+    # so both the target model and drafter see a properly formatted assistant turn.
     tokenizer = engine.verifier.tokenizer
-    prompt_ids = tokenizer.encode(args.prompt, return_tensors="pt")[0]
+    messages = [{"role": "user", "content": args.prompt}]
+    prompt_text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    prompt_ids = tokenizer(prompt_text, return_tensors="pt").input_ids[0]
 
     print(f"\nPrompt: {args.prompt}\n")
     t0 = time.perf_counter()
