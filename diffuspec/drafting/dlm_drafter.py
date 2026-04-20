@@ -187,13 +187,25 @@ class DLMDrafter:
 
 def test_draft():
     drafter = DLMDrafter(num_refinement_steps=1)
-    prefix = "The color of the sky is"
+    prefix = "Abby Road is a famous album by the"
     prefix_ids = drafter.tokenizer(prefix, add_special_tokens=False, return_tensors="pt").input_ids[0]
     draft_len = 5
 
     draft_ids, log_probs = drafter.draft(prefix_ids, draft_len)
+    print("Drafted ids:", draft_ids)
     print("Drafted tokens:", drafter.tokenizer.batch_decode(draft_ids))
     print("Log-probs shape:", log_probs.shape)
+    # top 10 toekens for each position
+    topk = 10
+    topk_probs, topk_indices = torch.topk(log_probs, topk, dim=-1)
+    print("Top-k tokens and log-probs for each position:")
+    for i in range(draft_len):
+        tokens = drafter.tokenizer.batch_decode(topk_indices[i])
+        probs = topk_probs[i].tolist()
+        print(f"Position {i}:")
+        for t, p in zip(tokens, probs):
+            print(f"  {t}: {p:.4f}")
+    
 
 if __name__ == "__main__":
     test_draft()
