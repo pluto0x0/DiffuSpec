@@ -6,8 +6,115 @@ All tests use tiny synthetic tensors to verify logic, not outputs.
 import math
 import pytest
 import torch
+import torch.nn.functional as F
 
 from diffuspec.control.adl import ADLController
+from diffuspec.drafting.dlm_drafter import DLMDrafter
+
+
+# ─── DLM Drafter mock ─────────────────────────────────────────────────────────
+
+VOCAB_SIZE = 100
+PEAK_TOKEN = 42   # token the mock model always peaks at
+MASK_TOKEN = 0
+
+
+class _FixedLogitModel:
+    """Returns logits strongly peaked at PEAK_TOKEN for every position."""
+    def __call__(self, input_ids):
+        B, L = input_ids.shape
+        logits = torch.full((B, L, VOCAB_SIZE), -10.0)
+        logits[:, :, PEAK_TOKEN] = 10.0
+        return logits
+
+
+def _make_drafter(num_refinement_steps=1, target_vocab_size=None) -> DLMDrafter:
+    drafter = object.__new__(DLMDrafter)
+    drafter.device = "cpu"
+    drafter.dtype = torch.float32
+    drafter.num_refinement_steps = num_refinement_steps
+    drafter.target_vocab_size = target_vocab_size
+    drafter.mask_token_id = MASK_TOKEN
+    drafter.model = _FixedLogitModel()
+    return drafter
+
+
+class TestDLMDrafter:
+
+    def setup_method(self):
+        self.prefix = torch.tensor([1, 2, 3])
+        self.draft_len = 5
+        self.drafter = _make_drafter()
+
+    def test_draft_output_shapes(self):
+        """draft() returns (draft_len,) ids and (draft_len, V) log-probs."""
+        draft_ids, log_probs = self.drafter.draft(self.prefix, self.draft_len)
+        assert draft_ids.shape == (self.draft_len,)
+        assert log_probs.shape == (self.draft_len, VOCAB_SIZE)
+
+    def test_draft_ids_are_argmax_of_log_probs(self):
+        """Eq. 5 (S=1): draft_ids[i] = argmax qϕ(yi | context)."""
+        draft_ids, log_probs = self.drafter.draft(self.prefix, self.draft_len)
+        assert torch.all(draft_ids == log_probs.argmax(dim=-1))
+
+    def test_log_probs_are_valid_log_softmax(self):
+        """log_probs must be a proper log-probability distribution at each position."""
+        _, log_probs = self.drafter.draft(self.prefix, self.draft_len)
+        prob_sums = log_probs.exp().sum(dim=-1)
+        assert torch.allclose(prob_sums, torch.ones(self.draft_len), atol=1e-5)
+
+    def test_draft_ids_peaked_at_mock_token(self):
+        """With a fixed-logit mock, every position should draft PEAK_TOKEN."""
+        draft_ids, _ = self.drafter.draft(self.prefix, self.draft_len)
+        assert torch.all(draft_ids == PEAK_TOKEN)
+
+    def test_vocab_masking_blocks_out_of_range_tokens(self):
+        """Tokens with id >= target_vocab_size must never be drafted (vocab mismatch fix)."""
+        # PEAK_TOKEN=42; set target_vocab_size=30 so it's masked out
+        drafter = _make_drafter(target_vocab_size=30)
+        draft_ids, _ = drafter.draft(self.prefix, self.draft_len)
+        assert torch.all(draft_ids < 30)
+
+    def test_draft_multistep_same_result(self):
+        """With a fixed-logit mock, S=2 refinement must agree with S=1."""
+        drafter_s2 = _make_drafter(num_refinement_steps=2)
+        ids1, lp1 = self.drafter.draft(self.prefix, self.draft_len)
+        ids2, lp2 = drafter_s2.draft(self.prefix, self.draft_len)
+        assert torch.all(ids1 == ids2)
+
+    # -- compute_l2r_logprobs (Eq. 6) -----------------------------------------
+
+    def test_l2r_logprobs_shape(self):
+        """Eq. 6: returns a scalar log-prob per draft position — shape (draft_len,)."""
+        draft_ids, _ = self.drafter.draft(self.prefix, self.draft_len)
+        l2r = self.drafter.compute_l2r_logprobs(self.prefix, draft_ids)
+        assert l2r.shape == (self.draft_len,)
+
+    def test_l2r_logprobs_are_non_positive(self):
+        """Log-probabilities must be ≤ 0."""
+        draft_ids, _ = self.drafter.draft(self.prefix, self.draft_len)
+        l2r = self.drafter.compute_l2r_logprobs(self.prefix, draft_ids)
+        assert torch.all(l2r <= 1e-6)
+
+    def test_l2r_logprobs_score_drafted_token(self):
+        """
+        Eq. 6: l2r[i] = log qϕ(draft_ids[i] | prefix ∘ draft[0:i] ∘ [MASK]^{k-i}).
+        With the fixed-logit mock, draft_ids[i] == PEAK_TOKEN and the mock always
+        assigns high probability to it, so each l2r score should be close to 0.
+        """
+        draft_ids, _ = self.drafter.draft(self.prefix, self.draft_len)
+        l2r = self.drafter.compute_l2r_logprobs(self.prefix, draft_ids)
+        # log-prob of the clearly dominant token ≈ log(softmax(10 vs -10)) ≈ 0
+        assert torch.all(l2r > -1.0)
+
+    def test_l2r_lower_for_non_peak_token(self):
+        """l2r of a non-peak token should be lower than that of the peak token."""
+        draft_ids_peak = torch.full((self.draft_len,), PEAK_TOKEN, dtype=torch.long)
+        draft_ids_off = torch.full((self.draft_len,), PEAK_TOKEN + 1, dtype=torch.long)
+
+        l2r_peak = self.drafter.compute_l2r_logprobs(self.prefix, draft_ids_peak)
+        l2r_off = self.drafter.compute_l2r_logprobs(self.prefix, draft_ids_off)
+        assert torch.all(l2r_peak > l2r_off)
 from diffuspec.search.cps import CausalConsistencyPathSearch
 from diffuspec.proxy.ngram_proxy import NgramProxy, UniformProxy
 

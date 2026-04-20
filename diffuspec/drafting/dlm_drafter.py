@@ -18,42 +18,6 @@ from typing import Tuple, Optional
 from transformers import AutoTokenizer, AutoModelForMaskedLM, AutoModel
 
 
-def _patch_rope_init_functions() -> None:
-    """
-    Inject 'default' into transformers ROPE_INIT_FUNCTIONS if missing.
-
-    Dream-7B's modeling code uses rope_type='default' (standard RoPE, no scaling),
-    but transformers ≥5.x removed that key.  We add it back as the identity init:
-        inv_freq = 1 / base^(2i/dim),  attention_scaling = 1.0
-    """
-    try:
-        from transformers import modeling_rope_utils
-        if "default" not in modeling_rope_utils.ROPE_INIT_FUNCTIONS:
-            def _compute_default_rope_parameters(config=None, device=None, seq_len=None, **kwargs):
-                if config is not None:
-                    base = getattr(config, "rope_theta", getattr(config, "default_theta", 10000.0))
-                    head_dim = getattr(config, "head_dim", None)
-                    if head_dim is None:
-                        head_dim = config.hidden_size // config.num_attention_heads
-                    partial = getattr(config, "partial_rotary_factor", 1.0)
-                    dim = int(head_dim * partial)
-                else:
-                    base = kwargs.get("base", 10000.0)
-                    dim = kwargs.get("dim", 64)
-
-                inv_freq = 1.0 / (
-                    base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
-                )
-                return inv_freq, 1.0
-
-            modeling_rope_utils.ROPE_INIT_FUNCTIONS["default"] = _compute_default_rope_parameters
-    except Exception:
-        pass  # If patching fails, the model load will surface the real error
-
-
-_patch_rope_init_functions()
-
-
 class DLMDrafter:
     """
     Wraps a masked-diffusion LM (e.g., Dream-7B) for speculative drafting.
@@ -219,3 +183,17 @@ class DLMDrafter:
             return output
         # Some models return a tuple; first element is logits
         return output[0]
+
+
+def test_draft():
+    drafter = DLMDrafter(num_refinement_steps=1)
+    prefix = "The color of the sky is"
+    prefix_ids = drafter.tokenizer(prefix, add_special_tokens=False, return_tensors="pt").input_ids[0]
+    draft_len = 5
+
+    draft_ids, log_probs = drafter.draft(prefix_ids, draft_len)
+    print("Drafted tokens:", drafter.tokenizer.batch_decode(draft_ids))
+    print("Log-probs shape:", log_probs.shape)
+
+if __name__ == "__main__":
+    test_draft()
