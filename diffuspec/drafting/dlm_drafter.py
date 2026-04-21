@@ -105,7 +105,9 @@ class DLMDrafter:
 
         for step in range(self.num_refinement_steps):
             logits = self._forward(current_ids)               # [1, L, V]
-            draft_logits = logits[0, prefix_len:, :]          # [draft_len, V]
+            # Dream is Qwen2.5-based (causal): logits[j] predicts token j+1,
+            # so the first draft position (prefix_len) is predicted by logits[prefix_len-1].
+            draft_logits = logits[0, prefix_len - 1: prefix_len - 1 + draft_len, :]  # [draft_len, V]
             if self.target_vocab_size is not None and draft_logits.shape[-1] > self.target_vocab_size:
                 draft_logits = draft_logits.clone()
                 draft_logits[:, self.target_vocab_size:] = float("-inf")
@@ -158,10 +160,12 @@ class DLMDrafter:
 
         logits = self._forward(batch)  # [draft_len, total_len, V]
 
-        # Extract log-prob of the actual draft token at position prefix_len + i
+        # Extract log-prob of the actual draft token at position prefix_len + i.
+        # Causal convention: logits[j] predicts token j+1, so position prefix_len+i
+        # is predicted by logits[prefix_len+i-1].
         scores = torch.zeros(draft_len, device=self.device)
         for i in range(draft_len):
-            pos_logits = logits[i, prefix_len + i, :]           # [V]
+            pos_logits = logits[i, prefix_len + i - 1, :]       # [V]
             lp = F.log_softmax(pos_logits, dim=-1)
             scores[i] = lp[draft_ids[i]]
 

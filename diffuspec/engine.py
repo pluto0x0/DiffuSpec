@@ -182,6 +182,7 @@ class DiffuSpec:
         self.adl.reset()
         context = prefix_ids.clone()
         generated: List[int] = []
+        _step_rows: List[dict] = []  # populated only when verbose=True
 
         stats = {
             "n_steps": 0,
@@ -193,24 +194,34 @@ class DiffuSpec:
 
         t_start = time.perf_counter()
 
+        _sync = (
+            torch.cuda.synchronize
+            if torch.cuda.is_available()
+            else (lambda: None)
+        )
+
         while len(generated) < max_new_tokens:
             k_t = self.adl.next_k
 
             # ── Stage 1: Draft ──────────────────────────────────────────
+            _sync(); t_draft = time.perf_counter()
             draft_ids, draft_log_probs = self.drafter.draft(
                 prefix_ids=context,
                 draft_len=k_t,
                 top_m=self.config.cps.M_max,
             )
+            _sync(); t_draft = time.perf_counter() - t_draft
 
             # ── Stage 2: CPS ─────────────────────────────────────────────
-            # Convert to list for proxy scoring (which operates on token IDs)
+            # Move log-probs to CPU so CPS beam search (.item() calls) stays cheap.
             prefix_list = context.tolist()
+            _sync(); t_cps = time.perf_counter()
             path_tokens, path_len = self.cps.search(
                 prefix_ids=prefix_list,
-                dlm_log_probs=draft_log_probs,
+                dlm_log_probs=draft_log_probs.cpu().float(),
                 causal_proxy=self.proxy,
             )
+            t_cps = time.perf_counter() - t_cps
 
             if path_len == 0:
                 # Degenerate: nothing drafted; run target LM greedily for one step
@@ -227,6 +238,7 @@ class DiffuSpec:
             # ── Stage 3: L2R log-probs + Parallel verification ──────────
             # L2R log-probs are only used for stochastic acceptance (temperature > 0).
             # Skipping the O(k²) Dream batch call in greedy mode saves significant time.
+            _sync(); t_verify = time.perf_counter()
             if self.config.temperature > 0.0:
                 l2r_logprobs = self.drafter.compute_l2r_logprobs(context, path_tensor)
             else:
@@ -238,6 +250,7 @@ class DiffuSpec:
                 drafter_l2r_logprobs=l2r_logprobs,
                 temperature=self.config.temperature,
             )
+            _sync(); t_verify = time.perf_counter() - t_verify
 
             # Advance context
             accepted_list = accepted_ids.tolist()
@@ -253,13 +266,34 @@ class DiffuSpec:
             stats["total_accepted"] += n_acc
             stats["accepted_lengths"].append(n_acc)
             stats["draft_lengths"].append(k_t)
+            stats.setdefault("draft_times_s", []).append(t_draft)
+            stats.setdefault("cps_times_s", []).append(t_cps)
+            stats.setdefault("verify_times_s", []).append(t_verify)
 
             if verbose:
-                print(
-                    f"step {stats['n_steps']:4d} | k={k_t:3d} | "
-                    f"path_len={path_len} | acc={n_acc} | "
-                    f"ema_gen={self.adl.ema_gen:.1f} | ema_acc={self.adl.ema_acc:.1f}"
-                )
+                tok = self.verifier.tokenizer
+                # context_before = tokens accepted *before* this step
+                context_before = generated[: len(generated) - len(accepted_list)]
+                context_text = tok.decode(context_before, skip_special_tokens=False)
+                # Truncate to last 40 chars so the table stays readable
+                if len(context_text) > 40:
+                    context_text = "…" + context_text[-40:]
+                draft_text = tok.decode(path_tokens, skip_special_tokens=False)
+                accepted_text = tok.decode(accepted_list, skip_special_tokens=False)
+                _step_rows.append({
+                    "step": stats["n_steps"],
+                    "k": k_t,
+                    "draft_len": path_len,
+                    "acc": f"{n_acc}/{path_len}",
+                    "context": context_text,
+                    "draft": draft_text,
+                    "accepted": accepted_text,
+                    "t_draft_ms": round(t_draft * 1e3),
+                    "t_cps_ms": round(t_cps * 1e3),
+                    "t_verify_ms": round(t_verify * 1e3),
+                    "ema_gen": round(self.adl.ema_gen, 1),
+                    "ema_acc": round(self.adl.ema_acc, 1),
+                })
 
             if hit_eos or bool(stop_ids & set(accepted_list)):
                 break
@@ -271,6 +305,14 @@ class DiffuSpec:
         if stats["n_steps"] > 0:
             stats["mean_accepted"] = stats["total_accepted"] / stats["n_steps"]
 
+        if verbose and _step_rows:
+            import pandas as pd
+            df = pd.DataFrame(_step_rows)
+            print("\n── Per-step trace ──")
+            print(df.to_string(index=False))
+            print()
+
+        stats["step_rows"] = _step_rows
         return torch.tensor(generated, dtype=torch.long), stats
 
     # ------------------------------------------------------------------

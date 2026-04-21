@@ -147,28 +147,31 @@ class ARVerifier:
 
         accepted: list = []
         hit_eos = False
+        n_accepted = 0  # counts only truly-matched draft tokens, not replacement
 
         for i in range(draft_len):
             if greedy_tokens[i].item() == draft_ids[i].item():
                 accepted.append(draft_ids[i])
+                n_accepted += 1
                 if draft_ids[i].item() in self._stop_ids:
                     hit_eos = True
                     break
             else:
-                # Rejection: take the target's greedy token as replacement
+                # Rejection: take the target's greedy token as replacement and stop.
+                # No bonus token here — bonus is only valid when all drafts are accepted.
                 accepted.append(greedy_tokens[i])
                 if greedy_tokens[i].item() in self._stop_ids:
                     hit_eos = True
                 break
-
-        n_accepted = len(accepted)
-        # If we accepted everything, append the next target token (bonus token)
-        if n_accepted == draft_len and not hit_eos:
-            bonus_logits = full_logits[prefix_len - 1 + draft_len]  # next position
-            bonus_tok = bonus_logits.argmax()
-            accepted.append(bonus_tok)
-            if bonus_tok.item() in self._stop_ids:
-                hit_eos = True
+        else:
+            # for-else: loop completed without break → every draft token was accepted.
+            # Append bonus token conditioned on prefix + accepted draft (correct context).
+            if not hit_eos:
+                bonus_logits = full_logits[prefix_len - 1 + draft_len]  # next position
+                bonus_tok = bonus_logits.argmax()
+                accepted.append(bonus_tok)
+                if bonus_tok.item() in self._stop_ids:
+                    hit_eos = True
 
         return torch.stack(accepted), n_accepted, hit_eos
 

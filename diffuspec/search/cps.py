@@ -139,25 +139,32 @@ class CausalConsistencyPathSearch:
         candidate_sets: List[List[Tuple[int, float]]] = []
         eos_encountered = False  # stop expanding after first EOS column
 
+        # Ensure float32: bfloat16 has no native CPU instructions, making .exp() and
+        # any sort-like op ~100x slower than float32 on CPU.
+        if dlm_log_probs.dtype != torch.float32:
+            dlm_log_probs = dlm_log_probs.float()
+
         for pos in range(dlm_log_probs.shape[0]):
             if eos_encountered:
                 break
 
-            lp = dlm_log_probs[pos]  # [V]
-            probs = lp.exp()
+            lp = dlm_log_probs[pos]  # [V], float32
 
-            # Sort descending by probability
-            sorted_indices = torch.argsort(probs, descending=True)
+            # topk is O(V) vs argsort O(V log V).  We never need more than M_max
+            # tokens, so there is no reason to sort the full vocabulary.
+            k = min(self.M_max, lp.shape[0])
+            top_probs, top_indices = torch.topk(lp.exp(), k, largest=True, sorted=True)
+
+            # Convert to Python lists once — avoids repeated .item() overhead.
+            tok_ids: List[int] = top_indices.tolist()
+            probs_list: List[float] = top_probs.tolist()
+            lp_vals: List[float] = lp[top_indices].tolist()
 
             candidates: List[Tuple[int, float]] = []
             cumulative = 0.0
             eos_added = False
 
-            for rank, idx in enumerate(sorted_indices):
-                tok_id = idx.item()
-                p = probs[idx].item()
-                lp_val = lp[idx].item()
-
+            for tok_id, p, lp_val in zip(tok_ids, probs_list, lp_vals):
                 if tok_id == self.eos_token_id:
                     eos_added = True
 
@@ -169,15 +176,17 @@ class CausalConsistencyPathSearch:
                 if cumulative >= self.tau and eos_added:
                     break
 
-            # Guarantee EOS is present
+            # Guarantee EOS is present if it fell outside the top-M window
             if not eos_added:
                 eos_lp = lp[self.eos_token_id].item()
                 candidates.append((self.eos_token_id, eos_lp))
 
             candidate_sets.append(candidates)
 
-            # Mark that EOS was available; next position will be pruned away
-            if any(tok == self.eos_token_id for tok, _ in candidates):
+            # Only stop lattice expansion when EOS ranked naturally in the top-M
+            # candidates (eos_added=True from inside the loop). Force-appended EOS
+            # (added below M_max purely as a guarantee) should NOT cut the draft short.
+            if eos_added:
                 eos_encountered = True
 
         return candidate_sets

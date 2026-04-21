@@ -96,16 +96,43 @@ def main():
     )
     elapsed = time.perf_counter() - t0
 
+    import pandas as pd
+
     output_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
     print(f"Generated: {output_text}\n")
-    print(f"--- Stats ---")
-    print(f"  Steps        : {stats['n_steps']}")
-    print(f"  Total tokens : {stats['total_accepted']}")
-    if stats['n_steps'] > 0:
-        print(f"  Mean-MAT     : {stats['mean_accepted']:.2f}")
-    print(f"  Wall time    : {elapsed:.2f}s")
+
+    # ── Basic stats (always shown) ────────────────────────────────────────
     tok_per_sec = stats["total_accepted"] / max(elapsed, 1e-6)
-    print(f"  Throughput   : {tok_per_sec:.1f} tok/s")
+    basic = pd.DataFrame([
+        {"metric": "Steps",         "value": stats["n_steps"]},
+        {"metric": "Total tokens",  "value": stats["total_accepted"]},
+        {"metric": "Mean-MAT",      "value": f"{stats.get('mean_accepted', 0):.2f}"},
+        {"metric": "Wall time (s)", "value": f"{elapsed:.2f}"},
+        {"metric": "Throughput",    "value": f"{tok_per_sec:.1f} tok/s"},
+    ])
+    print("── Stats ──")
+    print(basic.to_string(index=False))
+
+    # ── Timing breakdown (verbose only) ──────────────────────────────────
+    if args.verbose and stats["n_steps"] > 0:
+        draft_times  = stats.get("draft_times_s", [])
+        cps_times    = stats.get("cps_times_s", [])
+        verify_times = stats.get("verify_times_s", [])
+        if draft_times:
+            def _ms(lst): return f"{sum(lst)/len(lst)*1e3:.1f} ms"
+            timing = pd.DataFrame([
+                {"stage": "draft",  "avg": _ms(draft_times),
+                 "min": f"{min(draft_times)*1e3:.1f} ms",
+                 "max": f"{max(draft_times)*1e3:.1f} ms"},
+                {"stage": "CPS",    "avg": _ms(cps_times),
+                 "min": f"{min(cps_times)*1e3:.1f} ms",
+                 "max": f"{max(cps_times)*1e3:.1f} ms"},
+                {"stage": "verify", "avg": _ms(verify_times),
+                 "min": f"{min(verify_times)*1e3:.1f} ms",
+                 "max": f"{max(verify_times)*1e3:.1f} ms"},
+            ])
+            print("\n── Timing breakdown ──")
+            print(timing.to_string(index=False))
 
 
 if __name__ == "__main__":
