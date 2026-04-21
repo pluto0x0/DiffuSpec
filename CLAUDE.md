@@ -24,6 +24,9 @@ diffuspec/
 │   └── verifier.py            # Stage 3: AR 并行验证（greedy + stochastic）
 └── proxy/
     └── ngram_proxy.py         # 因果代理：NgramProxy / UniformProxy / KenLMProxy
+scripts/
+├── generate.py                # CLI 推理入口
+└── download_kenlm.py          # 下载预训练英文 3-gram KenLM 模型
 ```
 
 ---
@@ -44,11 +47,29 @@ diffuspec/
 
 ---
 
+## KenLM 代理配置
+
+论文使用在各数据集训练集上拟合的 3-gram KenLM 作为 CPS 因果代理。
+
+**下载预训练通用英文模型（OpenSLR Resource 11，~30 MB）：**
+```bash
+/venv/diffuspec/bin/python scripts/download_kenlm.py --out-dir models/kenlm
+```
+
+**指定任务专用模型（完全复现论文指标）：**
+```bash
+lmplz -o 3 < train_text.txt > models/kenlm/task.arpa
+```
+
+不指定 `--kenlm-model` 时退化为 `UniformProxy`（CPS 等效纯 DLM 打分）。
+
+---
+
 ## 测试
 
 ```bash
 /venv/diffuspec/bin/python -m pytest tests/test_components.py -v
-# 12 tests: ADLController(5) + CPS(4) + NgramProxy(3) — 全部通过
+# 22 tests: ADLController(5) + CPS(4) + NgramProxy(3) + KenLMProxy(...) — 全部通过
 ```
 
 ---
@@ -58,10 +79,15 @@ diffuspec/
 ```bash
 export HF_HOME=/workspace/.hf_home
 
+# 下载 KenLM 模型（首次运行）
+/venv/diffuspec/bin/python scripts/download_kenlm.py --out-dir models/kenlm
+
+# 推理
 /venv/diffuspec/bin/python scripts/generate.py \
     --prompt "Explain speculative decoding." \
     --target-model Qwen/Qwen3-8B \
     --drafter-model dream-org/dream-v0-instruct-7b \
+    --kenlm-model models/kenlm/3-gram.pruned.arpa \
     --max-new-tokens 128 \
     --device cuda \
     --verbose
@@ -73,6 +99,7 @@ export HF_HOME=/workspace/.hf_home
 
 - [ ] 处理 Qwen3-8B 与 Dream-7B 词表不对齐问题（vocab_size 151936 vs 152064）
 - [ ] 验证端到端 generate() 流程（加载双模型后实际运行）
-- [ ] 集成 3-gram KenLM proxy（论文实验使用，当前用 UniformProxy 占位）
+- [ ] 修复 CPS 候选集剪枝条件（Eq. 7 偏差：`cumulative >= τ and eos_added` 应拆分为独立条件）
 - [ ] 实现 Spec-Bench 评测流程（MAT / Speedup 指标）
 - [ ] 对 S、B、M_max、τ 做超参数消融实验（对应论文 Fig. 7）
+- [ ] 为各 Spec-Bench 任务训练任务专用 KenLM（论文用数据集训练集）

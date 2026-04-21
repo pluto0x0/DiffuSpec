@@ -44,6 +44,16 @@ def parse_args():
     # Refinement steps
     p.add_argument("--refinement-steps", type=int, default=1)
 
+    # Causal proxy (paper uses 3-gram KenLM per dataset)
+    p.add_argument(
+        "--kenlm-model",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Path to a pre-trained KenLM model (.arpa / .arpa.gz / .bin). "
+             "When omitted, CPS falls back to UniformProxy (DLM-only scoring).",
+    )
+
     p.add_argument("--verbose", action="store_true")
     return p.parse_args()
 
@@ -71,6 +81,7 @@ def main():
         target_model_name=args.target_model,
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
+        kenlm_model_path=args.kenlm_model,
     )
 
     print(f"Loading DiffuSpec (target={args.target_model}, drafter={args.drafter_model})...")

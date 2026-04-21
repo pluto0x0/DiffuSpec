@@ -108,24 +108,67 @@ try:
 
     class KenLMProxy:
         """
-        Wrapper around a pre-built KenLM model for high-quality n-gram scoring.
+        Wrapper around a pre-built KenLM ARPA/binary model for high-quality n-gram scoring.
+
+        The proxy decodes token IDs back to text via the HuggingFace tokenizer and scores
+        at the word level, matching how KenLM models are typically trained (on plain text).
 
         Usage:
-            proxy = KenLMProxy("path/to/lm.arpa")
+            proxy = KenLMProxy("path/to/lm.arpa", tokenizer=hf_tokenizer)
+
+        Args:
+            model_path : path to a KenLM .arpa / .arpa.gz / .bin model file.
+            tokenizer  : HuggingFace tokenizer used to decode token IDs → text.
+                         When omitted, token IDs are stringified (for testing only).
+            context_window : number of recent token IDs to decode for word context.
+                             20 tokens comfortably covers the 2-word context a 3-gram
+                             model needs, while keeping decode overhead small.
         """
 
-        def __init__(self, model_path: str):
+        def __init__(self, model_path: str, tokenizer=None, context_window: int = 20):
             self._model = _kenlm.Model(model_path)
+            self._tokenizer = tokenizer
+            self._context_window = context_window
+
+        # ------------------------------------------------------------------
+        # Internal helpers
+        # ------------------------------------------------------------------
+
+        def _decode(self, ids: List[int]) -> str:
+            """Decode a list of token IDs to a text string."""
+            if self._tokenizer is not None:
+                return self._tokenizer.decode(ids, skip_special_tokens=True)
+            return " ".join(str(t) for t in ids)
+
+        # ------------------------------------------------------------------
+        # Public API
+        # ------------------------------------------------------------------
 
         def score_token(self, context: List[int], token_id: int) -> float:
-            # KenLM operates on string tokens; here we convert int ids to strings
-            words = [str(t) for t in context] + [str(token_id)]
-            # log10 → natural log
-            return self._model.score(" ".join(words)) * math.log(10)
+            """
+            Approximate log p(token_id | context) using word-level KenLM.
+
+            We decode context[-context_window:] + [token_id] to text, split into
+            words, and return  log P(full_words) − log P(ctx_words)  (both in nats),
+            which equals the conditional log-prob of the last word(s) introduced by
+            token_id.  KenLM only needs the last (n−1) words for an n-gram model, so
+            capping the context window has no accuracy cost for n≤3.
+            """
+            ctx_ids = list(context[-self._context_window:])
+            full_ids = ctx_ids + [token_id]
+
+            ctx_text = self._decode(ctx_ids)
+            full_text = self._decode(full_ids)
+
+            # kenlm.score returns log10 probability of the whole string.
+            # Convert to natural log and take the difference to get the conditional.
+            full_lp = self._model.score(full_text, bos=False, eos=False)
+            ctx_lp = self._model.score(ctx_text, bos=False, eos=False) if ctx_ids else 0.0
+            return (full_lp - ctx_lp) * math.log(10)
 
         def score_sequence(self, token_ids: List[int]) -> float:
-            words = " ".join(str(t) for t in token_ids)
-            return self._model.score(words) * math.log(10)
+            text = self._decode(token_ids)
+            return self._model.score(text, bos=True, eos=True) * math.log(10)
 
 except ImportError:
     KenLMProxy = None  # type: ignore

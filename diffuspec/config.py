@@ -60,3 +60,8 @@ class DiffuSpecConfig:
     max_new_tokens: int = 512
     temperature: float = 0.0   # 0 → greedy (quality-locked, as in paper)
     eos_token_id: Optional[int] = None
+
+    # Path to a pre-trained KenLM model (.arpa / .arpa.gz / .bin).
+    # When set, CPS uses KenLMProxy instead of UniformProxy, matching the paper
+    # which fits a 3-gram KenLM on each dataset's training split (Sec. 4.2).
+    kenlm_model_path: Optional[str] = None

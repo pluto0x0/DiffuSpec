@@ -21,6 +21,7 @@ dependencies:
     - datasets
     - huggingface-hub>=0.26.0
     - kenlm; sys_platform != 'win32'
+    - pandas>=2.0.0
     - nltk
     - evaluate
     - rouge-score

@@ -25,7 +25,7 @@ from .drafting.dlm_drafter import DLMDrafter
 from .search.cps import CausalConsistencyPathSearch
 from .control.adl import ADLController
 from .verification.verifier import ARVerifier
-from .proxy.ngram_proxy import NgramProxy, UniformProxy
+from .proxy.ngram_proxy import NgramProxy, UniformProxy, KenLMProxy
 
 
 class DiffuSpec:
@@ -132,10 +132,24 @@ class DiffuSpec:
             device=device,
         )
 
-        # Causal proxy: use UniformProxy if none provided
+        # Causal proxy: KenLMProxy when a model path is configured, else UniformProxy
         if proxy is None:
-            vocab_size = target_tokenizer.vocab_size
-            proxy = UniformProxy(vocab_size)
+            kenlm_path = config.kenlm_model_path
+            if kenlm_path is not None:
+                if KenLMProxy is None:
+                    raise ImportError(
+                        "kenlm_model_path is set but the `kenlm` package is not installed. "
+                        "Run: pip install kenlm"
+                    )
+                try:
+                    proxy = KenLMProxy(kenlm_path, tokenizer=target_tokenizer)
+                    print(f"[DiffuSpec] Loaded KenLMProxy from: {kenlm_path}")
+                except OSError as exc:
+                    raise OSError(
+                        f"Failed to load KenLM model from '{kenlm_path}': {exc}"
+                    ) from exc
+            else:
+                proxy = UniformProxy(target_tokenizer.vocab_size)
 
         return cls(
             drafter=drafter,
