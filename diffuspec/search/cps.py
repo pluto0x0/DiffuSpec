@@ -89,16 +89,18 @@ class CausalConsistencyPathSearch:
                 break
 
             new_beams: List[BeamHypothesis] = []
+            cand_tok_ids = [tok_id for tok_id, _ in candidates]
             for hyp in beams:
                 if hyp.finished:
                     new_beams.append(hyp)
                     continue
 
-                for tok_id, dlm_lp in candidates:
-                    # Causal proxy score for context = prefix + hyp.tokens + [tok_id]
-                    context = prefix_ids + hyp.tokens
-                    ng_lp = causal_proxy.score_token(context, tok_id)
+                # Build context once per hypothesis (constant across all candidates).
+                context = prefix_ids + hyp.tokens
+                # Batch proxy scoring: decodes context string only once (KenLMProxy).
+                ng_lps = causal_proxy.score_tokens_batch(context, cand_tok_ids)
 
+                for (tok_id, dlm_lp), ng_lp in zip(candidates, ng_lps):
                     # Eq. 8: combined score
                     step_score = self.lam * dlm_lp + (1.0 - self.lam) * ng_lp
                     new_hyp = BeamHypothesis(
@@ -136,35 +138,44 @@ class CausalConsistencyPathSearch:
         Returns:
             List of length draft_len, each element is a list of (token_id, log_prob).
         """
-        candidate_sets: List[List[Tuple[int, float]]] = []
-        eos_encountered = False  # stop expanding after first EOS column
-
         # Ensure float32: bfloat16 has no native CPU instructions, making .exp() and
         # any sort-like op ~100x slower than float32 on CPU.
         if dlm_log_probs.dtype != torch.float32:
             dlm_log_probs = dlm_log_probs.float()
 
-        for pos in range(dlm_log_probs.shape[0]):
+        draft_len, V = dlm_log_probs.shape
+        k = min(self.M_max, V)
+
+        # Batched tensor ops over all positions at once — one exp, one topk, one gather,
+        # three tolist() calls instead of 3×draft_len separate operations.
+        all_probs = dlm_log_probs.exp()                                          # [draft_len, V]
+        top_probs, top_indices = torch.topk(all_probs, k, dim=1, sorted=True)   # [draft_len, k]
+        lp_top = dlm_log_probs.gather(1, top_indices)                            # [draft_len, k]
+
+        all_probs_list   = top_probs.tolist()    # [draft_len][k]  — Python floats, no more .item()
+        all_indices_list = top_indices.tolist()  # [draft_len][k]
+        all_lp_list      = lp_top.tolist()       # [draft_len][k]
+
+        # Pre-fetch EOS log-probs for all positions (used only when EOS falls outside top-k).
+        eos_lp_list: List[float] = dlm_log_probs[:, self.eos_token_id].tolist()
+
+        # Per-position pruning — pure Python arithmetic, no tensor ops inside the loop.
+        candidate_sets: List[List[Tuple[int, float]]] = []
+        eos_encountered = False
+
+        for pos in range(draft_len):
             if eos_encountered:
                 break
 
-            lp = dlm_log_probs[pos]  # [V], float32
-
-            # topk is O(V) vs argsort O(V log V).  We never need more than M_max
-            # tokens, so there is no reason to sort the full vocabulary.
-            k = min(self.M_max, lp.shape[0])
-            top_probs, top_indices = torch.topk(lp.exp(), k, largest=True, sorted=True)
-
-            # Convert to Python lists once — avoids repeated .item() overhead.
-            tok_ids: List[int] = top_indices.tolist()
-            probs_list: List[float] = top_probs.tolist()
-            lp_vals: List[float] = lp[top_indices].tolist()
+            tok_ids   = all_indices_list[pos]
+            probs     = all_probs_list[pos]
+            lp_vals   = all_lp_list[pos]
 
             candidates: List[Tuple[int, float]] = []
             cumulative = 0.0
             eos_added = False
 
-            for tok_id, p, lp_val in zip(tok_ids, probs_list, lp_vals):
+            for tok_id, p, lp_val in zip(tok_ids, probs, lp_vals):
                 if tok_id == self.eos_token_id:
                     eos_added = True
 
@@ -176,14 +187,13 @@ class CausalConsistencyPathSearch:
                 if cumulative >= self.tau and eos_added:
                     break
 
-            # Guarantee EOS is present if it fell outside the top-M window
+            # Guarantee EOS is present if it fell outside the top-k window
             if not eos_added:
-                eos_lp = lp[self.eos_token_id].item()
-                candidates.append((self.eos_token_id, eos_lp))
+                candidates.append((self.eos_token_id, eos_lp_list[pos]))
 
             candidate_sets.append(candidates)
 
-            # Only stop lattice expansion when EOS ranked naturally in the top-M
+            # Only stop lattice expansion when EOS ranked naturally in the top-k
             # candidates (eos_added=True from inside the loop). Force-appended EOS
             # (added below M_max purely as a guarantee) should NOT cut the draft short.
             if eos_added:

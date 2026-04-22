@@ -1,0 +1,113 @@
+{
+  "config": {
+    "target_model": "Qwen/Qwen2.5-32B-Instruct",
+    "drafter_model": "dream-org/dream-v0-instruct-7b",
+    "max_new_tokens": 128,
+    "kenlm_model": "models/kenlm/3-gram.pruned.arpa",
+    "k_min": 20,
+    "k_max": 30,
+    "delta": 10,
+    "rho": 0.5,
+    "M_max": 15,
+    "tau": 0.8,
+    "beam_size": 3,
+    "lam": 0.5,
+    "refinement_steps": 1
+  },
+  "datasets": [
+    {
+      "dataset": "gsm8k",
+      "n_samples": 10,
+      "ar_tok_per_s": 21.36,
+      "ds_tok_per_s": 36.69,
+      "speedup": 1.718,
+      "mat": 3.79,
+      "ar_total_s": 59.93,
+      "ds_total_s": 35.65,
+      "ar_total_tok": 1280,
+      "ds_total_tok": 1308,
+      "per_sample": [
+        {
+          "ar_wall_s": 6.0693,
+          "ar_tokens": 128,
+          "ds_wall_s": 2.881,
+          "ds_tokens": 131,
+          "mat": 4.458,
+          "speedup": 2.156
+        },
+        {
+          "ar_wall_s": 6.0938,
+          "ar_tokens": 128,
+          "ds_wall_s": 3.5779,
+          "ds_tokens": 132,
+          "mat": 3.552,
+          "speedup": 1.756
+        },
+        {
+          "ar_wall_s": 5.9544,
+          "ar_tokens": 128,
+          "ds_wall_s": 4.0371,
+          "ds_tokens": 131,
+          "mat": 2.97,
+          "speedup": 1.509
+        },
+        {
+          "ar_wall_s": 5.8139,
+          "ar_tokens": 128,
+          "ds_wall_s": 3.1028,
+          "ds_tokens": 129,
+          "mat": 4.375,
+          "speedup": 1.888
+        },
+        {
+          "ar_wall_s": 5.8917,
+          "ar_tokens": 128,
+          "ds_wall_s": 3.7041,
+          "ds_tokens": 129,
+          "mat": 3.778,
+          "speedup": 1.603
+        },
+        {
+          "ar_wall_s": 5.8774,
+          "ar_tokens": 128,
+          "ds_wall_s": 4.6002,
+          "ds_tokens": 128,
+          "mat": 2.368,
+          "speedup": 1.278
+        },
+        {
+          "ar_wall_s": 5.941,
+          "ar_tokens": 128,
+          "ds_wall_s": 3.56,
+          "ds_tokens": 128,
+          "mat": 3.571,
+          "speedup": 1.669
+        },
+        {
+          "ar_wall_s": 6.3134,
+          "ar_tokens": 128,
+          "ds_wall_s": 3.2874,
+          "ds_tokens": 131,
+          "mat": 4.038,
+          "speedup": 1.966
+        },
+        {
+          "ar_wall_s": 5.9072,
+          "ar_tokens": 128,
+          "ds_wall_s": 3.8613,
+          "ds_tokens": 132,
+          "mat": 4.077,
+          "speedup": 1.578
+        },
+        {
+          "ar_wall_s": 6.0697,
+          "ar_tokens": 128,
+          "ds_wall_s": 3.0366,
+          "ds_tokens": 137,
+          "mat": 4.708,
+          "speedup": 2.139
+        }
+      ]
+    }
+  ]
+}

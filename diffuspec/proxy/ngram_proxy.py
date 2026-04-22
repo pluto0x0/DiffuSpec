@@ -77,6 +77,10 @@ class NgramProxy:
         # Uniform fallback
         return -math.log(max(self._vocab_size, 1))
 
+    def score_tokens_batch(self, context: List[int], tok_ids: List[int]) -> List[float]:
+        """Score multiple tokens for the same context (no specialised speedup here)."""
+        return [self.score_token(context, t) for t in tok_ids]
+
     def score_sequence(self, token_ids: List[int]) -> float:
         """Sum of conditional log-probs for the full sequence."""
         if not token_ids:
@@ -98,6 +102,9 @@ class UniformProxy:
 
     def score_token(self, context: List[int], token_id: int) -> float:
         return self._lp
+
+    def score_tokens_batch(self, context: List[int], tok_ids: List[int]) -> List[float]:
+        return [self._lp] * len(tok_ids)
 
     def score_sequence(self, token_ids: List[int]) -> float:
         return self._lp * len(token_ids)
@@ -165,6 +172,25 @@ try:
             full_lp = self._model.score(full_text, bos=False, eos=False)
             ctx_lp = self._model.score(ctx_text, bos=False, eos=False) if ctx_ids else 0.0
             return (full_lp - ctx_lp) * math.log(10)
+
+        def score_tokens_batch(self, context: List[int], tok_ids: List[int]) -> List[float]:
+            """
+            Score multiple tokens sharing the same context.
+
+            Decodes and scores context once, then only decodes the appended token for
+            each candidate — reducing tokenizer.decode() calls from 2×M to 1+M.
+            """
+            ctx_ids = list(context[-self._context_window:])
+            ctx_text = self._decode(ctx_ids)
+            ctx_lp = self._model.score(ctx_text, bos=False, eos=False) if ctx_ids else 0.0
+            ln10 = math.log(10)
+
+            results: List[float] = []
+            for token_id in tok_ids:
+                full_text = self._decode(ctx_ids + [token_id])
+                full_lp = self._model.score(full_text, bos=False, eos=False)
+                results.append((full_lp - ctx_lp) * ln10)
+            return results
 
         def score_sequence(self, token_ids: List[int]) -> float:
             text = self._decode(token_ids)
