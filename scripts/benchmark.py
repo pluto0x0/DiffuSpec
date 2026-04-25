@@ -1,11 +1,17 @@
 """
 Benchmark speculative decoding speedup across datasets.
 
-Runs AR-greedy baseline and DiffuSpec on each dataset, reports per-dataset
-MAT, throughput, and speedup (DiffuSpec tok/s ÷ AR tok/s).
+Runs AR-greedy baseline and one or more speculative decoding engines on each
+dataset, reporting per-dataset MAT, throughput, and speedup.
 
-Both methods share the same loaded target model; DiffuSpec additionally loads
-the DLM drafter.  Models are loaded once and reused across all datasets.
+The target model is loaded once and shared across all engines.  When --mode all
+is used, the DLM drafter and verifier are also shared between DiffuSpec and
+NaiveSpec to avoid loading duplicate weights.
+
+Modes:
+  diffuspec  — DiffuSpec (CPS + ADL) vs AR baseline  [default]
+  naive      — Naive DLM spec-dec (argmax draft, no CPS/ADL) vs AR baseline
+  all        — Both engines vs AR baseline in one run
 
 Usage:
     python scripts/benchmark.py \\
@@ -16,6 +22,8 @@ Usage:
         --n-samples 50 \\
         --max-new-tokens 128 \\
         --device cuda \\
+        --mode all \\
+        --draft-len 5 \\
         --kenlm-model models/kenlm/3-gram.pruned.arpa \\
         --output results/benchmark.json
 """
@@ -32,7 +40,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from diffuspec import DiffuSpec, DiffuSpecConfig, DraftingConfig, CPSConfig, ADLConfig
+from diffuspec import (
+    DiffuSpec, DiffuSpecConfig, DraftingConfig, CPSConfig, ADLConfig,
+    NaiveSpec, NaiveSpecConfig,
+)
 
 # ── Dataset discovery ───────────────────────────────────────────────────────
 
@@ -63,7 +74,7 @@ def load_dataset(data_dir: Path, name: str, n_samples: Optional[int]) -> List[st
     return prompts
 
 
-# ── AR baseline ─────────────────────────────────────────────────────────────
+# ── Runners ──────────────────────────────────────────────────────────────────
 
 def _sync():
     if torch.cuda.is_available():
@@ -77,16 +88,17 @@ def run_ar(
     max_new_tokens: int,
     device: str,
 ) -> Dict[str, Any]:
-    """
-    Run the target model in plain autoregressive greedy mode.
-
-    Returns wall-clock time and number of new tokens generated.
-    """
+    """Run the target model in plain autoregressive greedy mode."""
     ids = input_ids.unsqueeze(0).to(device)
+    attention_mask = torch.ones_like(ids)
+    eos_id = model.config.eos_token_id
+    pad_token_id = eos_id[0] if isinstance(eos_id, list) else eos_id
     _sync()
     t0 = time.perf_counter()
     out = model.generate(
         ids,
+        attention_mask=attention_mask,
+        pad_token_id=pad_token_id,
         max_new_tokens=max_new_tokens,
         do_sample=False,
         temperature=None,
@@ -99,18 +111,8 @@ def run_ar(
     return {"wall_s": elapsed, "n_tokens": n_new}
 
 
-# ── DiffuSpec run ────────────────────────────────────────────────────────────
-
-def run_diffuspec(
-    engine: DiffuSpec,
-    input_ids: torch.Tensor,
-    max_new_tokens: int,
-) -> Dict[str, Any]:
-    """
-    Run DiffuSpec speculative decoding.
-
-    Returns wall-clock time, tokens generated, and MAT.
-    """
+def run_engine(engine, input_ids: torch.Tensor, max_new_tokens: int) -> Dict[str, Any]:
+    """Run any spec-dec engine that exposes .generate(prefix_ids, max_new_tokens)."""
     t0 = time.perf_counter()
     generated_ids, stats = engine.generate(
         prefix_ids=input_ids,
@@ -118,9 +120,11 @@ def run_diffuspec(
         verbose=False,
     )
     elapsed = time.perf_counter() - t0
-    n_tokens = len(generated_ids)
-    mat = stats.get("mean_accepted", 0.0)
-    return {"wall_s": elapsed, "n_tokens": n_tokens, "mat": mat}
+    return {
+        "wall_s":   elapsed,
+        "n_tokens": len(generated_ids),
+        "mat":      stats.get("mean_accepted", 0.0),
+    }
 
 
 # ── Per-dataset benchmark ────────────────────────────────────────────────────
@@ -128,18 +132,18 @@ def run_diffuspec(
 def benchmark_dataset(
     name: str,
     prompts: List[str],
-    engine: DiffuSpec,
+    engines: Dict[str, Any],   # ordered {display_name: engine}
     tokenizer,
     max_new_tokens: int,
     device: str,
     warmup_steps: int = 2,
 ) -> Dict[str, Any]:
     """
-    Run AR and DiffuSpec on all prompts, return aggregate stats.
+    Run AR baseline and every engine on all prompts, return aggregate stats.
 
     Warmup runs are not counted in the final timing.
     """
-    ar_model = engine.verifier.model
+    ar_model = next(iter(engines.values())).verifier.model
 
     def tokenize(prompt: str) -> torch.Tensor:
         messages = [{"role": "user", "content": prompt}]
@@ -153,96 +157,133 @@ def benchmark_dataset(
     for prompt in prompts[:warmup_steps]:
         ids = tokenize(prompt)
         run_ar(ar_model, ids, max_new_tokens=32, device=device)
-        run_diffuspec(engine, ids, max_new_tokens=32)
+        for engine in engines.values():
+            run_engine(engine, ids, max_new_tokens=32)
     print("done")
 
     # Timed runs
     ar_results: List[Dict] = []
-    ds_results: List[Dict] = []
+    engine_results: Dict[str, List[Dict]] = {m: [] for m in engines}
 
     for i, prompt in enumerate(prompts):
         print(f"\r  sample {i+1}/{len(prompts)}", end="", flush=True)
         ids = tokenize(prompt)
-
-        ar = run_ar(ar_model, ids, max_new_tokens, device)
-        ds = run_diffuspec(engine, ids, max_new_tokens)
-
-        ar_results.append(ar)
-        ds_results.append(ds)
+        ar_results.append(run_ar(ar_model, ids, max_new_tokens, device))
+        for method, engine in engines.items():
+            engine_results[method].append(run_engine(engine, ids, max_new_tokens))
 
     print()
 
-    # Aggregate
+    # Aggregate AR
     ar_total_s   = sum(r["wall_s"]   for r in ar_results)
     ar_total_tok = sum(r["n_tokens"] for r in ar_results)
-    ds_total_s   = sum(r["wall_s"]   for r in ds_results)
-    ds_total_tok = sum(r["n_tokens"] for r in ds_results)
+    ar_tps = ar_total_tok / ar_total_s if ar_total_s > 0 else 0.0
 
-    ar_tps  = ar_total_tok / ar_total_s if ar_total_s > 0 else 0.0
-    ds_tps  = ds_total_tok / ds_total_s if ds_total_s > 0 else 0.0
-    speedup = ds_tps / ar_tps if ar_tps > 0 else 0.0
-    mat     = sum(r["mat"] for r in ds_results) / len(ds_results) if ds_results else 0.0
+    # Aggregate each engine
+    methods_agg: Dict[str, Dict] = {}
+    for method, results in engine_results.items():
+        total_s   = sum(r["wall_s"]   for r in results)
+        total_tok = sum(r["n_tokens"] for r in results)
+        tps = total_tok / total_s if total_s > 0 else 0.0
+        mat = sum(r["mat"] for r in results) / len(results) if results else 0.0
+        methods_agg[method] = {
+            "tok_per_s": round(tps, 2),
+            "speedup":   round(tps / ar_tps, 3) if ar_tps > 0 else 0.0,
+            "mat":       round(mat, 3),
+            "total_s":   round(total_s, 2),
+            "total_tok": total_tok,
+        }
+
+    # Per-sample breakdown
+    per_sample = []
+    for i, a in enumerate(ar_results):
+        row: Dict[str, Any] = {
+            "ar_wall_s": round(a["wall_s"], 4),
+            "ar_tokens": a["n_tokens"],
+        }
+        for method in engines:
+            e = engine_results[method][i]
+            per_sample_speedup = (
+                round((e["n_tokens"] / e["wall_s"]) / (a["n_tokens"] / a["wall_s"]), 3)
+                if a["n_tokens"] > 0 and a["wall_s"] > 0 and e["wall_s"] > 0
+                else 0.0
+            )
+            row[f"{method}_wall_s"] = round(e["wall_s"], 4)
+            row[f"{method}_tokens"] = e["n_tokens"]
+            row[f"{method}_mat"]    = round(e["mat"], 3)
+            row[f"{method}_speedup"] = per_sample_speedup
+        per_sample.append(row)
 
     return {
-        "dataset":       name,
-        "n_samples":     len(prompts),
-        "ar_tok_per_s":  round(ar_tps, 2),
-        "ds_tok_per_s":  round(ds_tps, 2),
-        "speedup":       round(speedup, 3),
-        "mat":           round(mat, 3),
-        "ar_total_s":    round(ar_total_s, 2),
-        "ds_total_s":    round(ds_total_s, 2),
-        "ar_total_tok":  ar_total_tok,
-        "ds_total_tok":  ds_total_tok,
-        "per_sample":    [
-            {
-                "ar_wall_s": round(a["wall_s"], 4),
-                "ar_tokens": a["n_tokens"],
-                "ds_wall_s": round(d["wall_s"], 4),
-                "ds_tokens": d["n_tokens"],
-                "mat":       round(d["mat"], 3),
-                "speedup":   round(
-                    (d["n_tokens"] / d["wall_s"]) / (a["n_tokens"] / a["wall_s"]), 3
-                ) if a["n_tokens"] > 0 and a["wall_s"] > 0 else 0.0,
-            }
-            for a, d in zip(ar_results, ds_results)
-        ],
+        "dataset":      name,
+        "n_samples":    len(prompts),
+        "ar_tok_per_s": round(ar_tps, 2),
+        "ar_total_s":   round(ar_total_s, 2),
+        "ar_total_tok": ar_total_tok,
+        "methods":      methods_agg,
+        "per_sample":   per_sample,
     }
 
 
 # ── Summary table ────────────────────────────────────────────────────────────
 
-def print_table(rows: List[Dict]) -> None:
-    header = f"{'Dataset':<14} {'N':>4} {'AR tok/s':>10} {'DS tok/s':>10} {'Speedup':>9} {'MAT':>7}"
-    sep    = "-" * len(header)
+def print_table(rows: List[Dict], method_names: List[str]) -> None:
+    """
+    Print a summary table.  One group of (tok/s, speedup, MAT) columns per method.
+    """
+    # Column widths
+    W_DS = 14  # "Dataset"
+    W_N  =  5  # "N"
+    W_AR = 10  # "AR tok/s"
+    W_M  = 10  # "<method> tok/s"
+    W_SP =  9  # "speedup"
+    W_MT =  7  # "MAT"
+
+    # Header
+    hdr = f"{'Dataset':<{W_DS}} {'N':>{W_N}} {'AR tok/s':>{W_AR}}"
+    for m in method_names:
+        label = m[:W_M]  # truncate if needed
+        hdr += f"  {label:>{W_M}} {'speedup':>{W_SP}} {'MAT':>{W_MT}}"
+    sep = "-" * len(hdr)
+
     print("\n" + sep)
-    print(header)
-    print(sep)
-    for r in rows:
-        print(
-            f"{r['dataset']:<14} {r['n_samples']:>4} "
-            f"{r['ar_tok_per_s']:>10.1f} {r['ds_tok_per_s']:>10.1f} "
-            f"{r['speedup']:>8.3f}x {r['mat']:>7.3f}"
-        )
+    print(hdr)
     print(sep)
 
-    # Macro-average across datasets
-    mean_speedup = sum(r["speedup"] for r in rows) / len(rows)
-    mean_mat     = sum(r["mat"]     for r in rows) / len(rows)
-    # Micro-aggregate throughput
-    total_ar_tok = sum(r["ar_total_tok"] for r in rows)
-    total_ds_tok = sum(r["ds_total_tok"] for r in rows)
-    total_ar_s   = sum(r["ar_total_s"]   for r in rows)
-    total_ds_s   = sum(r["ds_total_s"]   for r in rows)
-    micro_ar_tps = total_ar_tok / total_ar_s  if total_ar_s  > 0 else 0.0
-    micro_ds_tps = total_ds_tok / total_ds_s  if total_ds_s  > 0 else 0.0
-    micro_speedup = micro_ds_tps / micro_ar_tps if micro_ar_tps > 0 else 0.0
-    print(
-        f"{'MEAN (macro)':<14} {sum(r['n_samples'] for r in rows):>4} "
-        f"{micro_ar_tps:>10.1f} {micro_ds_tps:>10.1f} "
-        f"{mean_speedup:>8.3f}x {mean_mat:>7.3f}"
-    )
-    print(f"{'MICRO speedup':<14} {'':>4} {'':>10} {'':>10} {micro_speedup:>8.3f}x")
+    for r in rows:
+        line = f"{r['dataset']:<{W_DS}} {r['n_samples']:>{W_N}} {r['ar_tok_per_s']:>{W_AR}.1f}"
+        for m in method_names:
+            mg = r["methods"].get(m, {})
+            tps     = mg.get("tok_per_s", 0.0)
+            speedup = mg.get("speedup",   0.0)
+            mat     = mg.get("mat",       0.0)
+            line += f"  {tps:>{W_M}.1f} {speedup:>{W_SP-1}.3f}x {mat:>{W_MT}.3f}"
+        print(line)
+
+    print(sep)
+
+    # Footer: macro-average speedup + MAT; micro-aggregate throughput
+    total_n       = sum(r["n_samples"]    for r in rows)
+    total_ar_tok  = sum(r["ar_total_tok"] for r in rows)
+    total_ar_s    = sum(r["ar_total_s"]   for r in rows)
+    micro_ar_tps  = total_ar_tok / total_ar_s if total_ar_s > 0 else 0.0
+
+    macro_line = f"{'MEAN (macro)':<{W_DS}} {total_n:>{W_N}} {micro_ar_tps:>{W_AR}.1f}"
+    micro_line = f"{'MICRO speedup':<{W_DS}} {'':>{W_N}} {'':>{W_AR}}"
+
+    for m in method_names:
+        mean_speedup = sum(r["methods"][m]["speedup"] for r in rows if m in r["methods"]) / len(rows)
+        mean_mat     = sum(r["methods"][m]["mat"]     for r in rows if m in r["methods"]) / len(rows)
+        total_m_tok  = sum(r["methods"][m]["total_tok"] for r in rows if m in r["methods"])
+        total_m_s    = sum(r["methods"][m]["total_s"]   for r in rows if m in r["methods"])
+        micro_m_tps  = total_m_tok / total_m_s if total_m_s > 0 else 0.0
+        micro_speedup = micro_m_tps / micro_ar_tps if micro_ar_tps > 0 else 0.0
+
+        macro_line += f"  {micro_m_tps:>{W_M}.1f} {mean_speedup:>{W_SP-1}.3f}x {mean_mat:>{W_MT}.3f}"
+        micro_line += f"  {'':>{W_M}} {micro_speedup:>{W_SP-1}.3f}x {'':>{W_MT}}"
+
+    print(macro_line)
+    print(micro_line)
     print(sep + "\n")
 
 
@@ -250,7 +291,7 @@ def print_table(rows: List[Dict]) -> None:
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Benchmark DiffuSpec speculative decoding speedup across datasets."
+        description="Benchmark speculative decoding speedup across datasets."
     )
     p.add_argument("--target-model",  type=str, default="Qwen/Qwen2.5-32B-Instruct")
     p.add_argument("--drafter-model", type=str, default="dream-org/dream-v0-instruct-7b")
@@ -267,7 +308,26 @@ def parse_args():
     p.add_argument("--warmup-steps",   type=int, default=2,
                    help="Warmup prompts before timing (not counted in results)")
 
-    # DiffuSpec hyperparameters
+    # Mode
+    p.add_argument(
+        "--mode",
+        type=str,
+        choices=["diffuspec", "naive", "all"],
+        default="diffuspec",
+        help=(
+            "'diffuspec' (default): DiffuSpec (CPS+ADL) vs AR. "
+            "'naive': naive DLM spec-dec vs AR. "
+            "'all': both engines vs AR in one run (shared drafter weights)."
+        ),
+    )
+
+    # Naive mode: fixed draft length
+    p.add_argument(
+        "--draft-len", type=int, default=5, metavar="K",
+        help="Fixed draft length per step for naive mode (default: 5).",
+    )
+
+    # DiffuSpec hyperparameters (used in modes: diffuspec, all)
     p.add_argument("--k-min",          type=int,   default=20)
     p.add_argument("--k-max",          type=int,   default=30)
     p.add_argument("--delta",          type=int,   default=10)
@@ -279,7 +339,7 @@ def parse_args():
     p.add_argument("--refinement-steps", type=int, default=1)
     p.add_argument("--kenlm-model",    type=str,   default=None,
                    metavar="PATH",
-                   help="KenLM model path. Omit to use UniformProxy.")
+                   help="KenLM model path for DiffuSpec CPS. Omit for UniformProxy.")
 
     p.add_argument("--output", type=str, default=None,
                    metavar="PATH",
@@ -292,7 +352,6 @@ def main():
     data_dir = Path(args.data_dir)
 
     datasets = args.datasets or DATASET_NAMES
-    # Filter to datasets that actually exist
     available = [d for d in datasets if (data_dir / d / "question.jsonl").exists()]
     missing   = [d for d in datasets if d not in available]
     if missing:
@@ -314,71 +373,110 @@ def main():
     )
     target_model.eval()
 
-    # ── Build DiffuSpec engine (reuses the loaded target model) ─────────────
-    print(f"Loading DLM drafter: {args.drafter_model}")
-    config = DiffuSpecConfig(
-        drafting=DraftingConfig(
-            model_name=args.drafter_model,
-            num_refinement_steps=args.refinement_steps,
-        ),
-        cps=CPSConfig(
-            M_max=args.M_max,
-            tau=args.tau,
-            beam_size=args.beam_size,
-            lam=args.lam,
-        ),
-        adl=ADLConfig(
-            k_min=args.k_min,
-            k_max=args.k_max,
-            delta=args.delta,
-            rho=args.rho,
-        ),
-        target_model_name=args.target_model,
-        max_new_tokens=args.max_new_tokens,
-        temperature=0.0,
-        kenlm_model_path=args.kenlm_model,
+    drafting_cfg = DraftingConfig(
+        model_name=args.drafter_model,
+        num_refinement_steps=args.refinement_steps,
     )
-    engine = DiffuSpec.from_config(
-        config,
-        target_model=target_model,
-        target_tokenizer=tokenizer,
-        device=args.device,
-    )
+
+    # ── Build engine(s) ──────────────────────────────────────────────────────
+    engines: Dict[str, Any] = {}
+
+    if args.mode in ("diffuspec", "all"):
+        print(f"Loading DLM drafter for DiffuSpec: {args.drafter_model}")
+        ds_config = DiffuSpecConfig(
+            drafting=drafting_cfg,
+            cps=CPSConfig(
+                M_max=args.M_max,
+                tau=args.tau,
+                beam_size=args.beam_size,
+                lam=args.lam,
+            ),
+            adl=ADLConfig(
+                k_min=args.k_min,
+                k_max=args.k_max,
+                delta=args.delta,
+                rho=args.rho,
+            ),
+            target_model_name=args.target_model,
+            max_new_tokens=args.max_new_tokens,
+            temperature=0.0,
+            kenlm_model_path=args.kenlm_model,
+        )
+        engines["diffuspec"] = DiffuSpec.from_config(
+            ds_config,
+            target_model=target_model,
+            target_tokenizer=tokenizer,
+            device=args.device,
+        )
+
+    if args.mode in ("naive", "all"):
+        naive_config = NaiveSpecConfig(
+            drafting=drafting_cfg,
+            target_model_name=args.target_model,
+            draft_len=args.draft_len,
+            max_new_tokens=args.max_new_tokens,
+            temperature=0.0,
+        )
+        if args.mode == "all":
+            # Share drafter + verifier with DiffuSpec to avoid loading duplicate weights.
+            naive_engine = NaiveSpec(
+                drafter=engines["diffuspec"].drafter,
+                verifier=engines["diffuspec"].verifier,
+                config=naive_config,
+            )
+        else:
+            print(f"Loading DLM drafter for NaiveSpec: {args.drafter_model}")
+            naive_engine = NaiveSpec.from_config(
+                naive_config,
+                target_model=target_model,
+                target_tokenizer=tokenizer,
+                device=args.device,
+            )
+        engines["naive"] = naive_engine
+
+    method_names = list(engines.keys())
+    print(f"Benchmarking mode: {args.mode}  |  engines: {method_names}\n")
 
     # ── Run benchmarks ───────────────────────────────────────────────────────
     all_results: List[Dict] = []
 
     for name in available:
         prompts = load_dataset(data_dir, name, args.n_samples)
-        print(f"\n[{name}] {len(prompts)} samples, max_new_tokens={args.max_new_tokens}")
+        print(f"[{name}] {len(prompts)} samples, max_new_tokens={args.max_new_tokens}")
         result = benchmark_dataset(
             name=name,
             prompts=prompts,
-            engine=engine,
+            engines=engines,
             tokenizer=tokenizer,
             max_new_tokens=args.max_new_tokens,
             device=args.device,
             warmup_steps=args.warmup_steps,
         )
         all_results.append(result)
-        print(
-            f"  AR {result['ar_tok_per_s']:.1f} tok/s | "
-            f"DS {result['ds_tok_per_s']:.1f} tok/s | "
-            f"speedup {result['speedup']:.3f}x | MAT {result['mat']:.3f}"
-        )
 
-    # ── Print summary ────────────────────────────────────────────────────────
-    print_table(all_results)
+        # Inline summary line
+        parts = [f"AR {result['ar_tok_per_s']:.1f} tok/s"]
+        for m in method_names:
+            mg = result["methods"][m]
+            parts.append(
+                f"{m}: {mg['tok_per_s']:.1f} tok/s  {mg['speedup']:.3f}x  MAT {mg['mat']:.3f}"
+            )
+        print("  " + "  |  ".join(parts))
 
-    # ── Save results ─────────────────────────────────────────────────────────
+    # ── Print summary table ───────────────────────────────────────────────────
+    print_table(all_results, method_names)
+
+    # ── Save results ──────────────────────────────────────────────────────────
     if args.output:
         out_path = Path(args.output)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "config": {
+                "mode":             args.mode,
                 "target_model":     args.target_model,
                 "drafter_model":    args.drafter_model,
                 "max_new_tokens":   args.max_new_tokens,
+                "draft_len":        args.draft_len,
                 "kenlm_model":      args.kenlm_model,
                 "k_min":            args.k_min,
                 "k_max":            args.k_max,

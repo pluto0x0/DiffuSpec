@@ -1,0 +1,119 @@
+{
+  "config": {
+    "mode": "naive",
+    "target_model": "Qwen/Qwen2.5-32B",
+    "drafter_model": "dream-org/dream-v0-instruct-7b",
+    "max_new_tokens": 512,
+    "draft_len": 6,
+    "kenlm_model": null,
+    "k_min": 20,
+    "k_max": 30,
+    "delta": 10,
+    "rho": 0.5,
+    "M_max": 15,
+    "tau": 0.8,
+    "beam_size": 3,
+    "lam": 0.5,
+    "refinement_steps": 1
+  },
+  "datasets": [
+    {
+      "dataset": "gsm8k",
+      "n_samples": 10,
+      "ar_tok_per_s": 35.25,
+      "ar_total_s": 68.22,
+      "ar_total_tok": 2405,
+      "methods": {
+        "naive": {
+          "tok_per_s": 68.78,
+          "speedup": 1.951,
+          "mat": 3.765,
+          "total_s": 34.97,
+          "total_tok": 2405
+        }
+      },
+      "per_sample": [
+        {
+          "ar_wall_s": 10.4209,
+          "ar_tokens": 368,
+          "naive_wall_s": 5.7849,
+          "naive_tokens": 368,
+          "naive_mat": 3.658,
+          "naive_speedup": 1.801
+        },
+        {
+          "ar_wall_s": 14.5863,
+          "ar_tokens": 512,
+          "naive_wall_s": 7.1433,
+          "naive_tokens": 512,
+          "naive_mat": 5.827,
+          "naive_speedup": 2.042
+        },
+        {
+          "ar_wall_s": 3.9026,
+          "ar_tokens": 138,
+          "naive_wall_s": 1.6615,
+          "naive_tokens": 138,
+          "naive_mat": 3.759,
+          "naive_speedup": 2.349
+        },
+        {
+          "ar_wall_s": 5.5991,
+          "ar_tokens": 198,
+          "naive_wall_s": 2.3023,
+          "naive_tokens": 198,
+          "naive_mat": 4.351,
+          "naive_speedup": 2.432
+        },
+        {
+          "ar_wall_s": 6.3538,
+          "ar_tokens": 224,
+          "naive_wall_s": 3.2762,
+          "naive_tokens": 224,
+          "naive_mat": 3.766,
+          "naive_speedup": 1.939
+        },
+        {
+          "ar_wall_s": 2.2305,
+          "ar_tokens": 78,
+          "naive_wall_s": 1.3443,
+          "naive_tokens": 78,
+          "naive_mat": 2.714,
+          "naive_speedup": 1.659
+        },
+        {
+          "ar_wall_s": 2.9653,
+          "ar_tokens": 104,
+          "naive_wall_s": 1.7284,
+          "naive_tokens": 104,
+          "naive_mat": 2.852,
+          "naive_speedup": 1.716
+        },
+        {
+          "ar_wall_s": 9.7833,
+          "ar_tokens": 346,
+          "naive_wall_s": 5.1801,
+          "naive_tokens": 346,
+          "naive_mat": 3.806,
+          "naive_speedup": 1.889
+        },
+        {
+          "ar_wall_s": 4.2886,
+          "ar_tokens": 152,
+          "naive_wall_s": 2.1933,
+          "naive_tokens": 152,
+          "naive_mat": 3.0,
+          "naive_speedup": 1.955
+        },
+        {
+          "ar_wall_s": 8.0935,
+          "ar_tokens": 285,
+          "naive_wall_s": 4.3526,
+          "naive_tokens": 285,
+          "naive_mat": 3.914,
+          "naive_speedup": 1.859
+        }
+      ]
+    }
+  ]
+}

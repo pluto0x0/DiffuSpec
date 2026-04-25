@@ -65,3 +65,26 @@ class DiffuSpecConfig:
     # When set, CPS uses KenLMProxy instead of UniformProxy, matching the paper
     # which fits a 3-gram KenLM on each dataset's training split (Sec. 4.2).
     kenlm_model_path: Optional[str] = None
+
+
+@dataclass
+class NaiveSpecConfig:
+    """
+    Config for the naive speculative decoding baseline.
+
+    The naive method uses the DLM drafter's argmax output directly (no CPS, no ADL):
+      1. DLM produces a fixed-length draft block.
+      2. AR verifier accepts the longest matching prefix (standard spec-dec rule).
+    """
+    drafting: DraftingConfig = field(default_factory=DraftingConfig)
+
+    # Target LM settings
+    target_model_name: str = "Qwen/Qwen2.5-32B-Instruct"
+
+    # Fixed draft length per speculative step (replaces ADL's adaptive k_t).
+    draft_len: int = 5
+
+    # Generation settings
+    max_new_tokens: int = 512
+    temperature: float = 0.0
+    eos_token_id: Optional[int] = None

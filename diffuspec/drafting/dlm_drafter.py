@@ -61,12 +61,19 @@ class DLMDrafter:
             )
         self.model.eval()
 
-        # Mask token used to initialise the draft block
-        self.mask_token_id: int = (
-            self.tokenizer.mask_token_id
-            if self.tokenizer.mask_token_id is not None
-            else self.tokenizer.unk_token_id
+        # Dream-7B exposes mask_token_id in model config; tokenizer may not set it.
+        self.mask_token_id: int = next(
+            (v for v in [self.tokenizer.mask_token_id,
+                         getattr(self.model.config, "mask_token_id", None),
+                         self.tokenizer.unk_token_id]
+             if v is not None),
+            None,
         )
+        if self.mask_token_id is None:
+            raise ValueError(
+                "Cannot determine mask token ID. "
+                "Neither tokenizer.mask_token_id nor model.config.mask_token_id is set."
+            )
 
     # ------------------------------------------------------------------
     # Public API

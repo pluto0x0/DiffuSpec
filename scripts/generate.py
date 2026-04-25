@@ -17,7 +17,10 @@ import torch
 
 sys.path.insert(0, ".")
 
-from diffuspec import DiffuSpec, DiffuSpecConfig, DraftingConfig, CPSConfig, ADLConfig
+from diffuspec import (
+    DiffuSpec, DiffuSpecConfig, DraftingConfig, CPSConfig, ADLConfig,
+    NaiveSpec, NaiveSpecConfig,
+)
 
 
 def parse_args():
@@ -29,13 +32,32 @@ def parse_args():
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--temperature", type=float, default=0.0)
 
-    # ADL hyperparameters (paper defaults)
+    # Mode: full DiffuSpec pipeline or naive DLM-draft-then-verify baseline
+    p.add_argument(
+        "--mode",
+        type=str,
+        choices=["diffuspec", "naive"],
+        default="diffuspec",
+        help="'diffuspec' (default): full pipeline with CPS + ADL. "
+             "'naive': DLM argmax draft → AR verify, no CPS/ADL.",
+    )
+
+    # Naive mode: fixed draft length (replaces ADL)
+    p.add_argument(
+        "--draft-len",
+        type=int,
+        default=5,
+        metavar="K",
+        help="Fixed draft length per step for --mode naive (default: 5).",
+    )
+
+    # ADL hyperparameters (paper defaults; used only in --mode diffuspec)
     p.add_argument("--k-min", type=int, default=20)
     p.add_argument("--k-max", type=int, default=30)
     p.add_argument("--delta", type=int, default=10)
     p.add_argument("--rho", type=float, default=0.5)
 
-    # CPS hyperparameters (paper defaults)
+    # CPS hyperparameters (paper defaults; used only in --mode diffuspec)
     p.add_argument("--M-max", type=int, default=15)
     p.add_argument("--tau", type=float, default=0.8)
     p.add_argument("--beam-size", type=int, default=3)
@@ -44,14 +66,15 @@ def parse_args():
     # Refinement steps
     p.add_argument("--refinement-steps", type=int, default=1)
 
-    # Causal proxy (paper uses 3-gram KenLM per dataset)
+    # Causal proxy (paper uses 3-gram KenLM per dataset; used only in --mode diffuspec)
     p.add_argument(
         "--kenlm-model",
         type=str,
         default=None,
         metavar="PATH",
         help="Path to a pre-trained KenLM model (.arpa / .arpa.gz / .bin). "
-             "When omitted, CPS falls back to UniformProxy (DLM-only scoring).",
+             "When omitted, CPS falls back to UniformProxy (DLM-only scoring). "
+             "Ignored in --mode naive.",
     )
 
     p.add_argument("--verbose", action="store_true")
@@ -61,31 +84,46 @@ def parse_args():
 def main():
     args = parse_args()
 
-    config = DiffuSpecConfig(
-        drafting=DraftingConfig(
-            model_name=args.drafter_model,
-            num_refinement_steps=args.refinement_steps,
-        ),
-        cps=CPSConfig(
-            M_max=args.M_max,
-            tau=args.tau,
-            beam_size=args.beam_size,
-            lam=args.lam,
-        ),
-        adl=ADLConfig(
-            k_min=args.k_min,
-            k_max=args.k_max,
-            delta=args.delta,
-            rho=args.rho,
-        ),
-        target_model_name=args.target_model,
-        max_new_tokens=args.max_new_tokens,
-        temperature=args.temperature,
-        kenlm_model_path=args.kenlm_model,
+    drafting_cfg = DraftingConfig(
+        model_name=args.drafter_model,
+        num_refinement_steps=args.refinement_steps,
     )
 
-    print(f"Loading DiffuSpec (target={args.target_model}, drafter={args.drafter_model})...")
-    engine = DiffuSpec.from_config(config, device=args.device)
+    if args.mode == "naive":
+        config = NaiveSpecConfig(
+            drafting=drafting_cfg,
+            target_model_name=args.target_model,
+            draft_len=args.draft_len,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+        )
+        print(
+            f"Loading NaiveSpec (target={args.target_model}, "
+            f"drafter={args.drafter_model}, draft_len={args.draft_len})..."
+        )
+        engine = NaiveSpec.from_config(config, device=args.device)
+    else:
+        config = DiffuSpecConfig(
+            drafting=drafting_cfg,
+            cps=CPSConfig(
+                M_max=args.M_max,
+                tau=args.tau,
+                beam_size=args.beam_size,
+                lam=args.lam,
+            ),
+            adl=ADLConfig(
+                k_min=args.k_min,
+                k_max=args.k_max,
+                delta=args.delta,
+                rho=args.rho,
+            ),
+            target_model_name=args.target_model,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            kenlm_model_path=args.kenlm_model,
+        )
+        print(f"Loading DiffuSpec (target={args.target_model}, drafter={args.drafter_model})...")
+        engine = DiffuSpec.from_config(config, device=args.device)
 
     # Tokenise prompt using the target tokenizer, applying the instruct chat template
     # so both the target model and drafter see a properly formatted assistant turn.
@@ -127,21 +165,27 @@ def main():
     # ── Timing breakdown (verbose only) ──────────────────────────────────
     if args.verbose and stats["n_steps"] > 0:
         draft_times  = stats.get("draft_times_s", [])
-        cps_times    = stats.get("cps_times_s", [])
         verify_times = stats.get("verify_times_s", [])
         if draft_times:
             def _ms(lst): return f"{sum(lst)/len(lst)*1e3:.1f} ms"
-            timing = pd.DataFrame([
+            rows = [
                 {"stage": "draft",  "avg": _ms(draft_times),
                  "min": f"{min(draft_times)*1e3:.1f} ms",
                  "max": f"{max(draft_times)*1e3:.1f} ms"},
-                {"stage": "CPS",    "avg": _ms(cps_times),
-                 "min": f"{min(cps_times)*1e3:.1f} ms",
-                 "max": f"{max(cps_times)*1e3:.1f} ms"},
+            ]
+            cps_times = stats.get("cps_times_s", [])
+            if cps_times:
+                rows.append(
+                    {"stage": "CPS",    "avg": _ms(cps_times),
+                     "min": f"{min(cps_times)*1e3:.1f} ms",
+                     "max": f"{max(cps_times)*1e3:.1f} ms"},
+                )
+            rows.append(
                 {"stage": "verify", "avg": _ms(verify_times),
                  "min": f"{min(verify_times)*1e3:.1f} ms",
                  "max": f"{max(verify_times)*1e3:.1f} ms"},
-            ])
+            )
+            timing = pd.DataFrame(rows)
             print("\n── Timing breakdown ──")
             print(timing.to_string(index=False))
 
